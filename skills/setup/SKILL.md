@@ -1,108 +1,181 @@
 ---
 name: setup
-description: First-run installer that initializes the database, merges the routing block into the user-global CLAUDE config, registers repositories, optionally bulk-imports a knowledge directory, creates a shell-PATH symlink, and supports --uninstall removal. Use for "set up", "install anton-core", "initialize", "re-run setup", "configure anton-core", or "uninstall anton-core".
+description: State-aware concierge for the full anton-core install lifecycle. Use for "set up", "install anton-core", "initialize", "re-run setup", "configure anton-core", "update anton-core", "repair anton-core", "check anton-core status", or "uninstall anton-core".
 allowed-tools: Read, Edit, Bash, AskUserQuestion
 ---
 
 ## What it does
 
-End-to-end first-run installer for the plugin. Initializes `core.db` + `events.db` (schema + DEFAULT_CONFIG seed), merges the plugin-shipped fragment into `~/.claude/CLAUDE.md`, optionally installs an operator-shell launcher (`~/.local/bin/core` → `${CLAUDE_PLUGIN_DATA}/data/bin/core`) that execs the live self-update binary so a bare-shell `core` never goes stale after a `/plugin update`, and pins the `fragment.version` so subsequent runs idempotently detect the no-op fast path. Every binary invocation routes through `${CLAUDE_PLUGIN_ROOT}/scripts/core`, which auto-fetches the per-platform artifact on first call (see [ADR-0032](../../docs/adr/0032-marketplace-binary-distribution.md)).
+State-aware installer and lifecycle surface for anton-core. On invocation it runs a **state probe** (no install-state change; it records one classification line to the events log), classifies the install (fresh / healthy-current / update-available / partial), and either runs a clean first-time setup straight through or opens a guided menu (Health check · Reconfigure · Update or Repair · Uninstall). Mechanical plumbing — binary bootstrap, data-root persistence, the operator-shell launcher, the version-pin verify-back gate, the bootstrap-lock — runs silently behind four named progress stages. Supports `--check` (status, no install-state change), `--re-onboard`, and `--uninstall [--purge-data]`. Every binary call routes through `${CLAUDE_PLUGIN_ROOT}/scripts/core`, which auto-fetches the per-platform artifact on first call (see [ADR-0032](../../docs/adr/0032-marketplace-binary-distribution.md)).
 
 ## When to use
 
-- "set up", "install anton-core", "initialize", "re-run setup"
-- "configure anton-core", `/anton-core:setup`
+- "set up", "install anton-core", "initialize", "re-run setup", "configure anton-core"
+- "update anton-core", "repair anton-core", "check status", `/anton-core:setup`
+- "uninstall anton-core"
 - After a plugin update that ships a newer `claude-md-fragment.md`
 
-## How
+## Conventions (apply throughout)
 
-### Step 0. Argument triage
+- Every binary call routes through `"${CLAUDE_PLUGIN_ROOT}/scripts/core" <verb>`. Never invoke a bare `core` from this body.
+- `Edit` is the only mutator for `~/.claude/CLAUDE.md`; never `sed`/`awk`. Every step is a no-op when its precondition already holds.
+- Operator prompts use `AskUserQuestion` (never stdin).
+- Voice: neutral, warm, concise — no persona.
 
-If the operator's invocation arguments include the literal string `--uninstall`, jump to the **Uninstall** section below; do not run Steps 1–7. Also reject these combinations in prose before doing anything:
-
-- `--purge-data` without `--uninstall` → "`--purge-data` is only valid with `--uninstall`".
-- `--uninstall` with `--re-onboard` → "`--uninstall` and `--re-onboard` are mutually exclusive".
-- `--check` with any of `--uninstall` / `--purge-data` / `--re-onboard` → "`--check` is mutually exclusive with the destructive flags".
-
-The skill orchestrates these steps, using Claude Code tools for file IO and the `${CLAUDE_PLUGIN_ROOT}/scripts/core` shim for state writes:
-
-### Paste-input normalization (applies to every operator-pasted string in this skill)
+### Paste-input normalization (every operator-pasted string)
 
 1. Strip leading/trailing whitespace (ASCII space, tab, `\r`, `\n`, `\v`, `\f`).
 2. Convert CRLF and lone CR to `\n`.
 3. Reject any paste containing non-printable bytes other than `\n` / `\t` — re-prompt once, then abort the step on a second occurrence.
 4. For newline-separated pastes (repos), split AFTER normalization, trim each line, drop empties.
 
-1. **Database init.** Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" db init`. The shim sources `lib/wrapper.sh`, which auto-fetches the per-platform binary into `${CLAUDE_PLUGIN_DATA}/data/bin/anton-core-v${VERSION}` on first call (the natural bootstrap trigger). `db init` materializes `core.db` + `events.db`, applies all migrations, and seeds DEFAULT_CONFIG rows via `INSERT OR IGNORE`. Idempotent on re-run. Surface any non-zero exit as a setup-blocked notice naming the `reason` field from the precondition envelope.
+## Step 0 — Argument triage & flag validation
 
-### Step 1a. Persist data-root
+Parse the invocation args for `--check`, `--uninstall`, `--purge-data`, `--re-onboard`. Reject in prose before any work:
 
-Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup persist-data-dir`. Records the resolved data root in `~/.anton-core/config.json` so operator-shell `core` invocations (which lack `CLAUDE_PLUGIN_DATA`) resolve to the same persistent root as hooks/skills. Idempotent overwrite. Non-fatal warning on failure — the data-root override is a convenience for shell use, not required for the hook/skill lifecycle.
+- `--purge-data` without `--uninstall` → "`--purge-data` is only valid with `--uninstall`."
+- `--uninstall` with `--re-onboard` → "`--uninstall` and `--re-onboard` are mutually exclusive."
+- `--check` with any of `--uninstall` / `--purge-data` / `--re-onboard` → "`--check` is mutually exclusive with the other flags."
 
-### Step 1b. Token precondition
+Then route:
 
-Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup get-token --format json`.
+- `--uninstall` present → jump to **Uninstall**; do not run the probe-driven menu.
+- `--check` present → run **Step 1 (State probe)**, print the classification and — when `core.db` exists — the health summary already gathered in Step 1.8 (no second call). On a fresh box there is no DB to report on, so print "fresh — nothing installed yet". Then exit without changing install state. (`--check` makes no install-state change; on an installed box it appends a health-log row and the probe records one classification line — both append-only observations; on a fresh box it writes nothing at all, since the probe makes no binary call.)
+- otherwise → run **Step 1 (State probe)**, then **Step 2 (Routing)**.
 
-- **Exit 0:** read the raw token from stderr (a single line, no decoding) and prepend `ANTON_GITHUB_TOKEN=<token>` to every subsequent `"${CLAUDE_PLUGIN_ROOT}/scripts/core"` invocation in this skill run. The token never appears in operator-facing prose, summaries, or telemetry.
-- **Exit 3 (no token):** proceed without a token — do **not** prompt for `gh auth login` and do **not** abort. The token is optional; it only raises GitHub API rate limits for the news poller. Continue setup with no `ANTON_GITHUB_TOKEN` exported. (Goal: unauthenticated first-run — see docs/adr/0037-public-distribution.md.)
+## Step 1 — State probe (no install-state change)
 
-The exported `ANTON_GITHUB_TOKEN` lives only for this skill run — subsequent setup runs re-resolve from the env / `gh` waterfall.
+Gather, without writing anything. **Read-only guard:** every `"${CLAUDE_PLUGIN_ROOT}/scripts/core" <verb>` other than `db` / `--help` / `--version` opens — and therefore *creates and schemas* — `core.db` + `events.db` on first contact (the binary auto-constructs the data layer for any DB-backed verb). So the probe makes **no binary call when `core.db` is absent**: every binary-backed signal below is gated on the Step 1.1 `core.db`-existence boolean and falls back to its fresh-box default. Classification needs only the file-existence and `Read` signals, which never touch the binary.
 
-2. `Read` the plugin-shipped fragment at `${CLAUDE_PLUGIN_ROOT}/claude-md-fragment.md` (frontmatter carries `fragment-version`).
+1. **DB presence:** `[ -f "${CLAUDE_PLUGIN_DATA}/data/core.db" ]` and the same for `events.db`. Capture both as booleans; the `core.db` boolean gates every binary call below.
+2. **Fragment + pin:** `Read ~/.claude/CLAUDE.md` (a `Read`, never a binary call); detect the `<!-- anton-core:start -->` / `<!-- anton-core:end -->` sentinels. Pinned version — **only when `core.db` exists** — `"${CLAUDE_PLUGIN_ROOT}/scripts/core" config get --key fragment.version` (value is `null` when unset); when `core.db` is absent, treat the pin as `null` and skip the call.
+3. **Shipped fragment version:** `Read ${CLAUDE_PLUGIN_ROOT}/claude-md-fragment.md` frontmatter `fragment-version`.
+4. **Plugin version (display only):** `Read ${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json` `.version`.
+5. **Symlink state:** `readlink ~/.local/bin/core` → classify correct / legacy / dangling / collision / absent.
+6. **Onboarding flag:** **only when `core.db` exists**, `"${CLAUDE_PLUGIN_ROOT}/scripts/core" onboarding check`; when `core.db` is absent, treat onboarding as not-shown and skip the call.
+7. **Declines:** **only when `core.db` exists**, `config get --key onboarding.repos.declined` (and `.import.declined`, `.symlink.declined`); when `core.db` is absent, treat each decline as unset and skip the calls.
+8. **Health severity:** only when `core.db` exists, `"${CLAUDE_PLUGIN_ROOT}/scripts/core" report health --full` → read `report.severity`. On a fresh box (no `core.db`), SKIP this call.
 
-3. `Read` the operator's `~/.claude/CLAUDE.md` (treat absence as an empty file).
+Classify (first match wins):
 
-4. Scan for the sentinel pair `<!-- anton-core:start -->` and `<!-- anton-core:end -->`. **If present**, use `Edit` to replace the byte range between (and including) those markers with the new fragment body, keeping the sentinels intact. **If absent**, use `Edit` to append the fragment body bracketed by a fresh sentinel pair to EOF.
+- `core.db` absent AND no fragment → **fresh**.
+- `core.db` xor fragment present, OR symlink dangling/legacy/collision, OR health severity `critical` → **partial**.
+- structure intact AND shipped fragment version > pinned → **update-available**.
+- else → **healthy-current** (health ok/warning/degraded).
 
-5. **Operator-shell launcher (optional).** Install the data-dir launcher and point the `~/.local/bin/core` PATH symlink at it, so a bare-shell `core <verb>` always execs the live self-update binary (`data/versions/current`) rather than the version-pinned plugin cache that `/plugin update` rotates. Three ordered sub-steps; the whole step is convenience, not a hard requirement.
+**Classification telemetry (append-only observation).** When `events.db` exists, record one line:
 
-   **5a. Materialize `current`.** Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" update status >/dev/null 2>&1`. This verb is read-only (no network) but constructs the update orchestrator, which runs the one-shot legacy→versioned migration: it moves the first-install binary from `data/bin/anton-core-v${VERSION}` into `data/versions/v${VERSION}/anton-core`, writes the `installed-version` pin, and creates the `data/versions/current` symlink the launcher execs. A non-zero exit is a non-fatal warning (the launcher guards a missing `current`). Then confirm `[ -L "${CLAUDE_PLUGIN_DATA}/data/versions/current" ]`; if absent, emit a one-line stderr warning and continue.
+```
+"${CLAUDE_PLUGIN_ROOT}/scripts/core" event log --source setup --severity info --type SETUP_CLASSIFIED --subject <classification> --detail "pinned=<pin> shipped=<shipped> symlink=<state>"
+```
 
-   **5b. Install the launcher.** `mkdir -p "${CLAUDE_PLUGIN_DATA}/data/bin"`. When `${CLAUDE_PLUGIN_DATA}/data/bin/core` is absent or differs (`! cmp -s "${CLAUDE_PLUGIN_ROOT}/scripts/core-shim.sh" "${CLAUDE_PLUGIN_DATA}/data/bin/core"`), copy the shipped `scripts/core-shim.sh` into place and `chmod +x` it. Idempotent — a byte-identical launcher is left untouched. On `mkdir`/`cp` failure emit a one-line stderr warning and skip the rest of Step 5.
+On a fresh box (`events.db` absent — the health step was also skipped), DEFER this line to Step 3d (after `db init` creates the databases). A failed `event log` is a one-line warning, never a block. This is the only thing the probe writes, and it is an append-only observation — not an install-state change.
 
-   **5c. PATH symlink.** Create or refresh `${HOME}/.local/bin/core` → `${CLAUDE_PLUGIN_DATA}/data/bin/core`. `mkdir -p "$HOME/.local/bin"`; on mkdir failure emit a one-line stderr warning naming the directory and the errno, then skip (the symlink is convenience). At the symlink site:
-   - Site absent → create the symlink.
-   - Site is a symlink AND `readlink` matches `${CLAUDE_PLUGIN_DATA}/data/bin/core` byte-for-byte → no-op.
-   - Site is any symlink to anything else (the legacy `${CLAUDE_PLUGIN_ROOT}/scripts/core` target from a pre-launcher install, a different path, a dangling target) → overwrite via `ln -sfn` — this auto-migrates an existing install onto the launcher.
-   - Site exists but is NOT a symlink (regular file, dir, device) → refuse to clobber; emit a stderr warning naming the file; setup continues.
+## Step 2 — Routing
 
-   If `$HOME/.local/bin` is not on `$PATH`, emit a one-line stderr notice with the shell-RC line to add (e.g., `export PATH="$HOME/.local/bin:$PATH"`). Do NOT modify the operator's shell-RC.
+Match in order (first match wins):
 
-6. **Version pin (verify-back gate).** Compare the new `fragment-version` to the value returned by `"${CLAUDE_PLUGIN_ROOT}/scripts/core" config get --key fragment.version`; when the version advanced (or the row is absent), record the new pin via `"${CLAUDE_PLUGIN_ROOT}/scripts/core" config set --key fragment.version --value <X.Y.Z>`. Re-read the value; refuse to advance to Step 7 until the read-back returns the written value (defends against silent DB-locked / disk-full writes).
+- **fresh** → run **Install** (Steps 3–7) straight through; no menu. `--re-onboard` does **not** short-circuit here: a fresh box has no seeded database for `repos add` / `bulk-import` to write to, and Install runs onboarding un-gated as its Step 6 anyway, so an explicit `--re-onboard` on a fresh box is subsumed by the full install.
+- **`--re-onboard`** (non-fresh, no menu) → **Onboarding** directly (un-gated).
+- **non-fresh** → render an `AskUserQuestion` menu that names the detected state, with options ordered by class:
+  - healthy-current → Health check (recommended) · Reconfigure · Update or Repair · Uninstall
+  - update-available → Update (recommended) · Health check · Reconfigure · Uninstall
+  - partial → Repair (recommended) · Health check · Reconfigure · Uninstall
 
-### Step 6b. Interactive onboarding (gated)
+  Route the choice: Health check → **Health verify**; Reconfigure → **Onboarding**; Update → **Update**; Repair → **Repair**; Uninstall → **Uninstall**.
 
-1. Inspect the operator's invocation for the literal string `--re-onboard`. Record it.
-2. Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" onboarding check`.
-3. If `shown: true` AND `--re-onboard` was not present, skip directly to Step 7.
-4. Otherwise run the three sub-steps:
-   - **6b.a Repos.** Render an `AskUserQuestion` block: "Register repositories with anton-core? Paste absolute paths, one per line. Type \"skip\" to skip this step." Options: "Paste paths" (Other/free-text), "Skip for now". On paste: split (post-normalization), trim each line, drop empties, reject relative paths in prose. **Classify each path before registering it:** if the path itself contains a `.git` entry it is a single repo — register it with `"${CLAUDE_PLUGIN_ROOT}/scripts/core" repos add <path>`. If the path has no `.git` of its own but two or more of its immediate children do, the operator likely pasted a directory holding many repos; registering it as one repo would mint a single slug spanning every child, so do not do that silently. Warn and render a second `AskUserQuestion`: "<path> looks like a parent of multiple repositories, not a single repo. Register it as…" with options "Parent of many (Recommended)" and "A single repository". On "Parent of many" → `"${CLAUDE_PLUGIN_ROOT}/scripts/core" repos add <path> --type parent` (the binary expands a parent into one entry — and one slug — per child checkout); on "A single repository" → the plain `repos add <path>`. To instead scan a directory tree for unregistered checkouts, suggest `repos add --discover --base-dir <path>`. Render `✓ <path> (slug: ...)` on success, `✗ <path> — <reason>` on failure. Per-path failures do not abort.
-   - **6b.b Bulk-import.** Render an `AskUserQuestion` block: "Bulk-import a knowledge directory now? Provide an absolute path or type \"skip\"." On a path: run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" item bulk-import --path <dir> --recursive --dry-run --format summary`. On `file_count == 0`, report the count and continue. Otherwise render `file_count` + `by_type` + `dropped_by_owner_filter`, then render a second `AskUserQuestion` confirm. On confirm: re-run without `--dry-run`. Render `imported` / `tasks_created` / `errors`.
-   - **6b.c Mark shown.** Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" onboarding mark-shown`. Failure is a warning, not fatal.
+## Install (Steps 3–7)
 
-7. **Health verify.** Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" report health --full`. Surface the failing check names + their `detail` fields if `report.severity == "critical"`; setup exits successfully on `healthy` or `warning`/`degraded` with the warning list embedded in the operator-facing summary.
+### Step 3 — Stage 1: Foundation
 
-The skill never shells `sed` or `awk` — `Edit` is the only file mutator, and every step is a no-op when its precondition already holds.
+Print `1/4 Foundation`. Run, in order:
 
-## Behavior
+a. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" db init` — materializes `core.db` + `events.db`, applies migrations, seeds DEFAULT_CONFIG (`INSERT OR IGNORE`). Idempotent. Surface a non-zero exit as a setup-blocked notice naming the precondition `reason`.
+b. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup persist-data-dir` — records the resolved data root in `~/.anton-core/config.json`. Non-fatal: a failure is a one-line warning.
+c. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup get-token --format json`. **Exit 0:** read the token from stderr (single line, no decoding) and prepend `ANTON_GITHUB_TOKEN=<token>` to every subsequent `"${CLAUDE_PLUGIN_ROOT}/scripts/core"` call in this run; never print it. **Exit 3:** proceed without a token — do not prompt for `gh auth login`, do not abort (the token only raises news-poller rate limits).
+d. **Deferred classification telemetry (fresh only).** When the probe classified **fresh** (so `events.db` did not exist at Step 1), record the now-deferrable line — `"${CLAUDE_PLUGIN_ROOT}/scripts/core" event log --source setup --severity info --type SETUP_CLASSIFIED --subject fresh --detail "first-run install"`. A failed `event log` is a one-line warning.
 
-After a successful run, `core.db` and `events.db` exist at `${CLAUDE_PLUGIN_DATA}/data/`, fully schema'd and seeded; `~/.claude/CLAUDE.md` contains the fragment body bracketed by the `<!-- anton-core:start -->`/`<!-- anton-core:end -->` sentinel pair; `~/.local/bin/core` (when creation succeeded) is a symlink to the operator-shell launcher at `${CLAUDE_PLUGIN_DATA}/data/bin/core`, which execs `data/versions/current`; `"${CLAUDE_PLUGIN_ROOT}/scripts/core" config get --key fragment.version` returns the fragment's frontmatter version. Re-running over an up-to-date install rewrites the same bytes and re-pins the same version — no diff, no surprise. Spec: [docs/plugin-spec/07-skills/setup.md](../../docs/plugin-spec/07-skills/setup.md).
+### Step 4 — Stage 2: Connect to Claude
+
+Print `2/4 Connect to Claude`.
+
+a. `Read` `${CLAUDE_PLUGIN_ROOT}/claude-md-fragment.md` (frontmatter carries `fragment-version`).
+b. `Read` `~/.claude/CLAUDE.md` (treat absence as empty).
+c. Sentinels present → `Edit` to replace the byte range between (and including) `<!-- anton-core:start -->` / `<!-- anton-core:end -->` with the new fragment body, keeping the sentinels. Absent → `Edit` to append the fragment body bracketed by a fresh sentinel pair at EOF.
+d. **Version-pin verify-back gate:** compare shipped `fragment-version` to `config get --key fragment.version`; when advanced (or absent), `config set --key fragment.version --value <X.Y.Z>`, then re-read and refuse to advance until the read-back equals the written value.
+
+### Step 5 — Stage 3: Shell access (optional)
+
+Print `3/4 Shell access`. The whole stage is convenience; any failure is a one-line warning, then continue.
+
+a. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" update status >/dev/null 2>&1` to materialize `data/versions/current` (read-only; runs the one-shot legacy→versioned migration). Confirm `[ -L "${CLAUDE_PLUGIN_DATA}/data/versions/current" ]`; if absent, warn and continue.
+b. `mkdir -p "${CLAUDE_PLUGIN_DATA}/data/bin"`. When `${CLAUDE_PLUGIN_DATA}/data/bin/core` is absent or `! cmp -s "${CLAUDE_PLUGIN_ROOT}/scripts/core-shim.sh" "${CLAUDE_PLUGIN_DATA}/data/bin/core"`, copy `scripts/core-shim.sh` into place and `chmod +x`. On `mkdir`/`cp` failure, warn and skip the rest of the stage.
+c. `mkdir -p "$HOME/.local/bin"`, then point `${HOME}/.local/bin/core` → `${CLAUDE_PLUGIN_DATA}/data/bin/core` per the four-branch tree: absent → create; matching symlink → no-op; any other symlink (different path, dangling, or the legacy `scripts/core` target) → overwrite via `ln -sfn`; non-symlink (regular file/dir/device) → refuse to clobber, warn, continue. If `$HOME/.local/bin` is not on `$PATH`, print the shell-RC line to add (`export PATH="$HOME/.local/bin:$PATH"`) — do NOT edit the shell-RC.
+
+### Step 6 — Stage 4: Your content (onboarding)
+
+Print `4/4 Your content`. Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" onboarding check`; if `shown: true` and `--re-onboard` was not present, skip to Step 7. Otherwise run **Onboarding**.
+
+### Step 7 — Health verify + completion card
+
+`"${CLAUDE_PLUGIN_ROOT}/scripts/core" report health --full`. On `report.severity == "critical"`, surface the failing check names + their `detail` fields and stop before the card. On healthy/warning/degraded, print the **Completion card**.
+
+## Onboarding (sub-flow)
+
+Render ONE `AskUserQuestion` panel collecting the steps below; **omit any step whose `onboarding.<step>.declined` reads `true`** unless `--re-onboard` is set:
+
+- **Repos:** "Register repositories with anton-core? Paste absolute paths, one per line, or Skip."
+- **Knowledge:** "Bulk-import a knowledge directory? Absolute path, or Skip."
+- **Shell access:** (only if not already linked) "Add `core` to your shell PATH? Yes / Skip."
+
+**Plan-recap:** summarize the chosen actions in one line (e.g. "register 3 repos · import ~120 files · add `core` to PATH") and confirm before any write.
+
+**Execute:**
+
+- **Repos:** normalize the paste; for each path, classify before registering. If the path holds a `.git`, it is a single repo → `"${CLAUDE_PLUGIN_ROOT}/scripts/core" repos add <path>`. If it has no `.git` but two or more immediate children do, warn and render a second `AskUserQuestion`: "<path> looks like a parent of multiple repositories. Register it as…" with "Parent of many (Recommended)" → `repos add <path> --type parent`, or "A single repository" → `repos add <path>`. Render `✓ <path> (slug: …)` / `✗ <path> — <reason>`. Per-path failures do not abort.
+- **Import:** `"${CLAUDE_PLUGIN_ROOT}/scripts/core" item bulk-import --path <dir> --recursive --dry-run --format summary`. On `file_count == 0`, report and continue. Otherwise render `file_count` + `by_type` + `dropped_by_owner_filter`, confirm via a second `AskUserQuestion`, then re-run without `--dry-run` and render `imported` / `tasks_created` / `errors`.
+- **Shell access:** if "Yes" and not already linked, run Step 5c.
+
+**Persist declines:** for each Skipped step, `config set --key onboarding.<step>.declined --value true`. For each completed step, clear it with `config set --key onboarding.<step>.declined --value ""`.
+
+`"${CLAUDE_PLUGIN_ROOT}/scripts/core" onboarding mark-shown` (failure is a warning).
+
+## Repair (sub-flow)
+
+Re-run Steps 3–6 gated on their preconditions, narrating ONLY what was out of sync (e.g. "Routing fragment was missing — restored." / "Symlink was dangling — repointed."). Steps already in order stay silent. End with Step 7.
+
+## Update (sub-flow)
+
+Re-run Stage 2 (fragment refresh + re-pin) and Stage 3 (launcher refresh); SKIP onboarding. Report "Routing updated v<old> → v<new>." End with Step 7.
+
+## Health verify (menu action)
+
+`"${CLAUDE_PLUGIN_ROOT}/scripts/core" report health --full`; print the severity and any failing checks with their `detail`. Writes nothing.
+
+## Completion card
+
+```
+✓ anton-core — ready to use.
+
+Try this next:
+  /anton-core:save     "remember <a fact worth keeping>"
+  /anton-core:recall    --code <symbol>
+  /anton-core:summary   your daily briefing
+```
+
+When a repository was registered, name one in the `recall --code` line; when nothing was onboarded, collapse to `save` + `summary`. Never list a command that is not an installed skill.
 
 ## Uninstall
 
-When `--uninstall` is present in the operator's args:
+When `--uninstall` is present (or chosen from the menu):
 
-1. **Pre-flight.** Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup uninstall [--purge-data] --dry-run --format json`. Capture the envelope.
+1. **Pre-flight.** `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup uninstall [--purge-data] --dry-run --format json`. Capture `removed[*]` paths + `bytes`.
+2. **Scope (skip when `--purge-data` already given).** `AskUserQuestion`: "Remove anton-core, keep my data" (default) vs "Remove everything, erase my data" (⚠ also deletes `~/.anton-core/data` — saved knowledge, tasks, logs; no undo). The erase choice sets `--purge-data`.
+3. **Confirm.** Keep-data → a plain confirm listing each `removed[*]` path with humanized `bytes` and `kind`, the CLAUDE.md fragment-wipe callout (sentinel region is plugin-managed; hand-edits inside go with it), and the symlink-removal note. Erase-everything → require **typed confirmation**: "Type `erase` to confirm." Any other input cancels with zero mutation.
+4. **Breadcrumb before removal.** Append one line — `<ISO-8601 timestamp>\t<resolved paths>\t<total bytes>\t<scope>` — to `~/.anton-core/data/logs/uninstall.log`. Best-effort: a write failure is a warning, never a block.
+5. **Execute.** `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup uninstall [--purge-data] --format json` (acquires `${CLAUDE_PLUGIN_DATA}/data/bin/.bootstrap.lock`). Then `Read` `~/.claude/CLAUDE.md`; if sentinels present, `Edit` to delete the marker pair + body. Then `readlink ~/.local/bin/core`; if it resolves to `${CLAUDE_PLUGIN_DATA}/data/bin/core`, `rm -f ~/.local/bin/core`; otherwise warn ("not the launcher symlink, leaving in place") and continue.
+6. **Summary card.** Resolved paths removed, bytes freed (sum of `removed[*].bytes`), the callout that per-project memory under `~/.claude/projects/.../memory/` is untouched, the callout that a subsequent install is treated as first-run, and the reminder to run `/plugin uninstall anton-core` to complete removal.
 
-2. **Confirm.** Render a single `AskUserQuestion` block listing each `removed[*]` path with its `bytes` (humanized) and `kind`, plus three callouts:
-   - the CLAUDE.md fragment between `<!-- anton-core:start -->` / `<!-- anton-core:end -->` will be wiped (sentinel region is plugin-managed; operator hand-edits inside the markers go with it);
-   - the `~/.local/bin/core` symlink will be removed only when its target resolves to the launcher at `${CLAUDE_PLUGIN_DATA}/data/bin/core`;
-   - when `--purge-data` is set, a destructive callout: "This permanently erases your operator content. There is no undo."
-   Options: "Yes, uninstall" / "Cancel". Cancel exits cleanly with zero filesystem mutation.
+## Behavior
 
-3. **Execute (on Yes):**
-   a. Run `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup uninstall [--purge-data] --format json`. The verb acquires `<CLAUDE_PLUGIN_DATA>/data/bin/.bootstrap.lock` before the first removal — same derivation as `scripts/lib/wrapper.sh`, so a concurrent bash bootstrap cannot race the removal. Surface any non-zero envelope verbatim.
-   b. `Read` `~/.claude/CLAUDE.md`. If sentinels are present, use `Edit` to delete the marker pair + body. No-op if sentinels are absent.
-   c. Bash: `readlink ~/.local/bin/core 2>/dev/null`. If the resolved target equals `${CLAUDE_PLUGIN_DATA}/data/bin/core` (the launcher), `rm -f ~/.local/bin/core`. Otherwise emit a one-line stderr warning ("not the launcher symlink, leaving in place") and continue. (Step 3a's `setup uninstall` verb already wiped `${CLAUDE_PLUGIN_DATA}` wholesale — taking the launcher copy at `data/bin/core` with it — so this step removes only the home-dir symlink.)
-
-4. **Summary.** Print the resolved paths removed, bytes freed (sum of `removed[*].bytes`), the reminder to run `/plugin uninstall anton-core` separately to complete plugin removal, and the explicit callout that per-project memory under `~/.claude/projects/.../memory/` is untouched. Also note: a subsequent fresh install will be treated as first-run (the welcome flag was in the now-wiped config table).
+After a successful install, `core.db` + `events.db` exist at `${CLAUDE_PLUGIN_DATA}/data/`, schema'd and seeded; `~/.claude/CLAUDE.md` carries the fragment between the sentinel pair; `~/.local/bin/core` (when creation succeeded) points at the operator-shell launcher; `config get --key fragment.version` returns the shipped version. Re-running is idempotent — the probe + menu make no install-state change (they may append observation logs only) and every execution step is a no-op when its precondition holds. Spec: [docs/plugin-spec/07-skills/setup.md](../../docs/plugin-spec/07-skills/setup.md).
