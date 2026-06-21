@@ -66,6 +66,40 @@ if [ -z "${ANTON_DATA_DIR_AUTHORITATIVE+x}" ]; then
 fi
 export ANTON_DATA_DIR_AUTHORITATIVE
 
+# Non-authoritative (Bash-tool / operator-shell) invocation: resolve the data
+# root from ~/.anton-core/config.json (the documented operator-config tier)
+# BEFORE the cache default below, so binary location matches the data root the
+# binary itself would resolve. Setting CORE_DATA_DIR is load-bearing: it pins
+# the binary's resolver to step 1 and skips the dev-mode ./data probe, which
+# would otherwise mis-resolve when setup runs from a cwd containing ./data.
+_data_root_source="authoritative"
+if [[ "$ANTON_DATA_DIR_AUTHORITATIVE" == "no" ]] && [[ -z "${CLAUDE_PLUGIN_DATA+x}" ]]; then
+    # Read the operator-config data root inline. wrapper.sh is not sourced yet
+    # (sourcing it now would run its bootstrap side effects), and we need the
+    # root before the cache default below masks CLAUDE_PLUGIN_DATA. The read is
+    # pure (one file), so inlining it here is cheaper than splitting wrapper.sh
+    # into side-effect-free and exec halves (a recorded follow-up).
+    _anton_cfg_root=""
+    _anton_cfg="${HOME:-}/.anton-core/config.json"
+    if [[ -f "$_anton_cfg" ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            _anton_cfg_root="$(jq -r '.data_root // empty' "$_anton_cfg" 2>/dev/null || true)"
+        else
+            _anton_cfg_root="$(grep -E '"data_root"[[:space:]]*:[[:space:]]*"[^"]+"' "$_anton_cfg" 2>/dev/null \
+                | head -1 | sed -E 's/.*"data_root"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+        fi
+    fi
+    if [[ -n "$_anton_cfg_root" ]]; then
+        CLAUDE_PLUGIN_DATA="$_anton_cfg_root"
+        CORE_DATA_DIR="$_anton_cfg_root"
+        export CLAUDE_PLUGIN_DATA CORE_DATA_DIR
+        _data_root_source="operator-config"
+    else
+        _data_root_source="cache-fallback"
+    fi
+fi
+export _data_root_source
+
 # Derive PLUGIN_ROOT from the resolved shim path; default PLUGIN_DATA
 # to PLUGIN_ROOT (matches the CLAUDE_PLUGIN_DATA fallback in
 # scripts/lib/wrapper.sh). Both are := defaults — any caller that
@@ -149,6 +183,7 @@ if [[ "${1:-}" == "--wrapper-check" ]]; then
         jq -nc \
             --arg pr  "$CLAUDE_PLUGIN_ROOT" \
             --arg pd  "$CLAUDE_PLUGIN_DATA" \
+            --arg drs "${_data_root_source:-authoritative}" \
             --arg v   "$version" \
             --arg bp  "$bin_path" \
             --argjson be "$bin_exists" \
@@ -156,13 +191,14 @@ if [[ "${1:-}" == "--wrapper-check" ]]; then
             --arg db  "$dev_bin" \
             --argjson dbe "$dev_bin_exists" \
             --argjson wp "$wrapper_parses" \
-            '{plugin_root:$pr, plugin_data:$pd, data_root:$pd, version:$v, bin:$bp, bin_exists:$be, bin_in_managed_cache:$bmc, dev_bin:$db, dev_bin_exists:$dbe, wrapper_parses:$wp}'
+            '{plugin_root:$pr, plugin_data:$pd, data_root:$pd, data_root_source:$drs, version:$v, bin:$bp, bin_exists:$be, bin_in_managed_cache:$bmc, dev_bin:$db, dev_bin_exists:$dbe, wrapper_parses:$wp}'
     else
         _esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-        printf '{"plugin_root":"%s","plugin_data":"%s","data_root":"%s","version":"%s","bin":"%s","bin_exists":%s,"bin_in_managed_cache":%s,"dev_bin":"%s","dev_bin_exists":%s,"wrapper_parses":%s}\n' \
+        printf '{"plugin_root":"%s","plugin_data":"%s","data_root":"%s","data_root_source":"%s","version":"%s","bin":"%s","bin_exists":%s,"bin_in_managed_cache":%s,"dev_bin":"%s","dev_bin_exists":%s,"wrapper_parses":%s}\n' \
             "$(_esc "$CLAUDE_PLUGIN_ROOT")" \
             "$(_esc "$CLAUDE_PLUGIN_DATA")" \
             "$(_esc "$CLAUDE_PLUGIN_DATA")" \
+            "$(_esc "${_data_root_source:-authoritative}")" \
             "$(_esc "$version")" \
             "$(_esc "$bin_path")" \
             "$bin_exists" \

@@ -59,6 +59,7 @@ Gather, without writing anything. **Read-only guard:** every `"${CLAUDE_PLUGIN_R
 Classify (first match wins):
 
 - `core.db` absent AND no fragment → **fresh**.
+- `core.db` present AND fragment absent AND onboarding `shown:false` AND symlink absent AND health severity not `critical` → **fresh** (hook-bootstrapped: the SessionStart hook created `core.db` before setup ran).
 - `core.db` xor fragment present, OR symlink dangling/legacy/collision, OR health severity `critical` → **partial**.
 - structure intact AND shipped fragment version > pinned → **update-available**.
 - else → **healthy-current** (health ok/warning/degraded).
@@ -93,7 +94,7 @@ Print `1/4 Foundation`. Run, in order:
 a. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" db init` — materializes `core.db` + `events.db`, applies migrations, seeds DEFAULT_CONFIG (`INSERT OR IGNORE`). Idempotent. Surface a non-zero exit as a setup-blocked notice naming the precondition `reason`.
 b. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup persist-data-dir` — records the resolved data root in `~/.anton-core/config.json`. Non-fatal: a failure is a one-line warning.
 c. `"${CLAUDE_PLUGIN_ROOT}/scripts/core" setup get-token --format json`. **Exit 0:** read the token from stderr (single line, no decoding) and prepend `ANTON_GITHUB_TOKEN=<token>` to every subsequent `"${CLAUDE_PLUGIN_ROOT}/scripts/core"` call in this run; never print it. **Exit 3:** proceed without a token — do not prompt for `gh auth login`, do not abort (the token only raises news-poller rate limits).
-d. **Deferred classification telemetry (fresh only).** When the probe classified **fresh** (so `events.db` did not exist at Step 1), record the now-deferrable line — `"${CLAUDE_PLUGIN_ROOT}/scripts/core" event log --source setup --severity info --type SETUP_CLASSIFIED --subject fresh --detail "first-run install"`. A failed `event log` is a one-line warning.
+d. **Deferred classification telemetry (fresh only).** When the probe classified **fresh** (so `events.db` did not exist at Step 1), record the now-deferrable line — `"${CLAUDE_PLUGIN_ROOT}/scripts/core" event log --source setup --severity info --type SETUP_CLASSIFIED --subject fresh --detail "provenance=<truly-fresh|hook-bootstrapped>"` (use `hook-bootstrapped` when `core.db` already existed at Step 1, else `truly-fresh`). A failed `event log` is a one-line warning.
 
 ### Step 4 — Stage 2: Connect to Claude
 
@@ -130,7 +131,7 @@ Render ONE `AskUserQuestion` panel collecting the steps below; **omit any step w
 **Execute:**
 
 - **Repos:** normalize the paste; for each path, classify before registering. If the path holds a `.git`, it is a single repo → `"${CLAUDE_PLUGIN_ROOT}/scripts/core" repos add <path>`. If it has no `.git` but two or more immediate children do, warn and render a second `AskUserQuestion`: "<path> looks like a parent of multiple repositories. Register it as…" with "Parent of many (Recommended)" → `repos add <path> --type parent`, or "A single repository" → `repos add <path>`. Render `✓ <path> (slug: …)` / `✗ <path> — <reason>`. Per-path failures do not abort.
-- **Import:** `"${CLAUDE_PLUGIN_ROOT}/scripts/core" item bulk-import --path <dir> --recursive --dry-run --format summary`. On `file_count == 0`, report and continue. Otherwise render `file_count` + `by_type` + `dropped_by_owner_filter`, confirm via a second `AskUserQuestion`, then re-run without `--dry-run` and render `imported` / `tasks_created` / `errors`.
+- **Import:** `"${CLAUDE_PLUGIN_ROOT}/scripts/core" item bulk-import --path <dir> --recursive --dry-run --format summary`. On `file_count == 0`, report and continue. Otherwise render `file_count` + `by_type` + `dropped_by_owner_filter`, confirm via a second `AskUserQuestion`, then re-run without `--dry-run` and render `imported` / `tasks_created` / `errors`; when `degraded_no_vector` > 0, add a one-line note ("N file(s) imported without a vector — a tokenizer issue; searchable by text, re-runnable via `maintenance reindex`").
 - **Shell access:** if "Yes" and not already linked, run Step 5c.
 
 **Persist declines:** for each Skipped step, `config set --key onboarding.<step>.declined --value true`. For each completed step, clear it with `config set --key onboarding.<step>.declined --value ""`.
