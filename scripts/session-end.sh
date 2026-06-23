@@ -105,4 +105,10 @@ case "$CLAUDE_PLUGIN_ROOT" in
         ;;
 esac
 
+# Best-effort: fire a consolidation pass (Link always; Dream/RunAll on their
+# own cooldowns). Detached + --quiet so SessionEnd never blocks on an LLM pass;
+# the maintenance file-lock serializes against any concurrent consolidate, and
+# stderr is appended to a data-dir log so a silent failure leaves a trail.
+("$ANTON_BIN" maintenance consolidate --quiet 1>/dev/null 2>>"$LOG_DIR/consolidate.err" &)
+
 exec "$ANTON_BIN" hook session-end "$@"
