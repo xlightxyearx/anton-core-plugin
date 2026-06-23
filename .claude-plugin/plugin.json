@@ -1,7 +1,7 @@
 {
   "name": "anton-core",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "description": "Personal AI assistant — knowledge, tasks, code graph, session intelligence",
   "author": { "name": "xlightxyearx", "url": "https://github.com/xlightxyearx/anton-core-plugin" },
-  "requires-binary-version": ">=1.13.0"
+  "requires-binary-version": ">=1.14.0"
 }
